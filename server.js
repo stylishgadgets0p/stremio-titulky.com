@@ -49,7 +49,118 @@ app.use(express.urlencoded({ extended: true }));
 // Store user sessions (in production, use Redis or database)
 const userSessions = new Map();
 
-// Simplified subtitle matching system - focus only on video source
+// RealDebrid API client
+class RealDebridClient {
+    constructor(apiKey) {
+        this.apiKey = apiKey;
+        this.baseUrl = 'https://api.real-debrid.com/rest/1.0';
+    }
+
+    async getCurrentlyPlayingFile() {
+        try {
+            console.log('[REALDEBRID] Checking for currently playing file...');
+            
+            // Get user's downloads history (recent files)
+            const response = await axios.get(`${this.baseUrl}/downloads`, {
+                headers: {
+                    'Authorization': `Bearer ${this.apiKey}`,
+                    'User-Agent': 'Titulky-Stremio-Addon/1.0'
+                },
+                params: {
+                    page: 1,
+                    limit: 10
+                },
+                timeout: 5000
+            });
+
+            if (response.data && response.data.length > 0) {
+                // Get the most recent download (likely currently playing)
+                const recentFile = response.data[0];
+                console.log(`[REALDEBRID] Recent file: ${recentFile.filename}`);
+                
+                return {
+                    filename: recentFile.filename,
+                    generated: recentFile.generated,
+                    size: recentFile.filesize
+                };
+            }
+
+            console.log('[REALDEBRID] No recent downloads found');
+            return null;
+
+        } catch (error) {
+            console.error('[REALDEBRID] Error getting current file:', error.message);
+            if (error.response?.status === 401) {
+                console.error('[REALDEBRID] Invalid API key');
+            }
+            return null;
+        }
+    }
+
+    async getActiveStreams() {
+        try {
+            console.log('[REALDEBRID] Checking for active streams...');
+            
+            // Alternative: Check torrents that are currently downloading/seeding
+            const response = await axios.get(`${this.baseUrl}/torrents`, {
+                headers: {
+                    'Authorization': `Bearer ${this.apiKey}`,
+                    'User-Agent': 'Titulky-Stremio-Addon/1.0'
+                },
+                params: {
+                    filter: 'active',
+                    limit: 5
+                },
+                timeout: 5000
+            });
+
+            if (response.data && response.data.length > 0) {
+                const activeTorrent = response.data[0];
+                console.log(`[REALDEBRID] Active torrent: ${activeTorrent.filename}`);
+                
+                return {
+                    filename: activeTorrent.filename,
+                    progress: activeTorrent.progress,
+                    status: activeTorrent.status
+                };
+            }
+
+            console.log('[REALDEBRID] No active torrents found');
+            return null;
+
+        } catch (error) {
+            console.error('[REALDEBRID] Error getting active streams:', error.message);
+            return null;
+        }
+    }
+
+    async testApiKey() {
+        try {
+            console.log('[REALDEBRID] Testing API key...');
+            
+            const response = await axios.get(`${this.baseUrl}/user`, {
+                headers: {
+                    'Authorization': `Bearer ${this.apiKey}`,
+                    'User-Agent': 'Titulky-Stremio-Addon/1.0'
+                },
+                timeout: 5000
+            });
+
+            if (response.data && response.data.username) {
+                console.log(`[REALDEBRID] API key valid for user: ${response.data.username}`);
+                return { valid: true, username: response.data.username, premium: response.data.premium };
+            }
+
+            return { valid: false };
+
+        } catch (error) {
+            console.error('[REALDEBRID] API key test failed:', error.message);
+            return { valid: false, error: error.message };
+        }
+    }
+}
+
+// Enhanced Subtitle matching system with RealDebrid integration
 class SubtitleMatcher {
     constructor() {
         // Video source priority (higher = better match)
@@ -75,6 +186,205 @@ class SubtitleMatcher {
             'anniversary', 'collectors', 'limited', 'deluxe', 'redux',
             'final', 'complete', 'definitive', 'alternate', 'international'
         ];
+    }
+
+    // Extract video info from RealDebrid filename or stream title
+    extractVideoInfoFromRealDebrid(filename) {
+        console.log(`[MATCHER-RD] Analyzing RealDebrid file: "${filename}"`);
+        
+        const info = {
+            source: this.extractSource(filename),
+            quality: this.extractQuality(filename),
+            codec: this.extractCodec(filename),
+            audio: this.extractAudio(filename),
+            specialEdition: this.extractSpecialEdition(filename),
+            releaseGroup: this.extractReleaseGroup(filename),
+            originalTitle: filename
+        };
+
+        console.log(`[MATCHER-RD] Extracted info:`, info);
+        return info;
+    }
+
+    // Extract quality from filename
+    extractQuality(filename) {
+        const qualityPatterns = [
+            /2160p|4k/i,
+            /1080p/i,
+            /720p/i,
+            /480p/i,
+            /360p/i
+        ];
+        
+        const filenameLower = filename.toLowerCase();
+        
+        for (const pattern of qualityPatterns) {
+            if (pattern.test(filenameLower)) {
+                const match = filenameLower.match(pattern);
+                return match[0];
+            }
+        }
+        
+        return 'unknown';
+    }
+
+    // Extract codec from filename
+    extractCodec(filename) {
+        const codecPatterns = [
+            /x264/i,
+            /x265/i,
+            /h\.?264/i,
+            /h\.?265/i,
+            /hevc/i,
+            /avc/i,
+            /xvid/i,
+            /divx/i
+        ];
+        
+        const filenameLower = filename.toLowerCase();
+        
+        for (const pattern of codecPatterns) {
+            if (pattern.test(filenameLower)) {
+                const match = filenameLower.match(pattern);
+                return match[0].replace('.', '');
+            }
+        }
+        
+        return 'unknown';
+    }
+
+    // Extract audio info from filename
+    extractAudio(filename) {
+        const audioPatterns = [
+            /dts-hd/i,
+            /dts/i,
+            /truehd/i,
+            /atmos/i,
+            /dd5\.?1/i,
+            /ac3/i,
+            /aac/i,
+            /mp3/i,
+            /flac/i
+        ];
+        
+        const filenameLower = filename.toLowerCase();
+        
+        for (const pattern of audioPatterns) {
+            if (pattern.test(filenameLower)) {
+                const match = filenameLower.match(pattern);
+                return match[0];
+            }
+        }
+        
+        return 'unknown';
+    }
+
+    // Extract release group from filename
+    extractReleaseGroup(filename) {
+        // Release groups are usually at the end, after a dash or in brackets
+        const releasePatterns = [
+            /-([A-Z0-9]+)(?:\.[a-z0-9]+)*$/i,  // -RELEASEGROUP.ext
+            /\[([A-Z0-9]+)\]/i,                 // [RELEASEGROUP]
+            /\{([A-Z0-9]+)\}/i                  // {RELEASEGROUP}
+        ];
+        
+        for (const pattern of releasePatterns) {
+            const match = filename.match(pattern);
+            if (match && match[1] && match[1].length > 2) {
+                return match[1].toUpperCase();
+            }
+        }
+        
+        return 'unknown';
+    }
+
+    // Calculate enhanced compatibility score with RealDebrid info
+    calculateRealDebridCompatibilityScore(realDebridInfo, subtitleInfo, movieTitle = '') {
+        console.log(`[MATCHER-RD] Calculating RealDebrid compatibility`);
+        console.log(`[MATCHER-RD] RD file: "${realDebridInfo.originalTitle}"`);
+        console.log(`[MATCHER-RD] Subtitle: "${subtitleInfo.originalTitle || subtitleInfo.title}"`);
+
+        let score = 0;
+        let bonuses = [];
+
+        // 1. Source compatibility (40% of score)
+        const sourceScore = this.calculateCompatibilityScore(realDebridInfo, subtitleInfo, movieTitle);
+        score += sourceScore * 0.4;
+        bonuses.push(`Source: ${sourceScore.toFixed(1)}% * 0.4`);
+
+        // 2. Quality match (20% of score)
+        if (realDebridInfo.quality !== 'unknown' && subtitleInfo.originalTitle) {
+            const subtitleLower = subtitleInfo.originalTitle.toLowerCase();
+            if (subtitleLower.includes(realDebridInfo.quality)) {
+                const qualityBonus = 100;
+                score += qualityBonus * 0.2;
+                bonuses.push(`Quality match (${realDebridInfo.quality}): ${qualityBonus}% * 0.2`);
+            } else {
+                // Check for compatible qualities
+                const qualityMap = {
+                    '2160p': ['4k', '2160p'],
+                    '1080p': ['1080p', 'fhd'],
+                    '720p': ['720p', 'hd'],
+                    '480p': ['480p', 'sd']
+                };
+                
+                const compatibleQualities = qualityMap[realDebridInfo.quality] || [];
+                const hasCompatibleQuality = compatibleQualities.some(q => subtitleLower.includes(q));
+                
+                if (hasCompatibleQuality) {
+                    const compatibleBonus = 80;
+                    score += compatibleBonus * 0.2;
+                    bonuses.push(`Compatible quality: ${compatibleBonus}% * 0.2`);
+                } else {
+                    bonuses.push(`No quality match: 0% * 0.2`);
+                }
+            }
+        } else {
+            bonuses.push(`No quality info: 50% * 0.2`);
+            score += 50 * 0.2;
+        }
+
+        // 3. Codec match (15% of score)
+        if (realDebridInfo.codec !== 'unknown' && subtitleInfo.originalTitle) {
+            const subtitleLower = subtitleInfo.originalTitle.toLowerCase();
+            if (subtitleLower.includes(realDebridInfo.codec)) {
+                const codecBonus = 100;
+                score += codecBonus * 0.15;
+                bonuses.push(`Codec match (${realDebridInfo.codec}): ${codecBonus}% * 0.15`);
+            } else {
+                bonuses.push(`No codec match: 0% * 0.15`);
+            }
+        } else {
+            bonuses.push(`No codec info: 50% * 0.15`);
+            score += 50 * 0.15;
+        }
+
+        // 4. Release group match (15% of score)
+        if (realDebridInfo.releaseGroup !== 'unknown' && subtitleInfo.originalTitle) {
+            const subtitleLower = subtitleInfo.originalTitle.toLowerCase();
+            const releaseGroupLower = realDebridInfo.releaseGroup.toLowerCase();
+            
+            if (subtitleLower.includes(releaseGroupLower)) {
+                const releaseBonus = 100;
+                score += releaseBonus * 0.15;
+                bonuses.push(`Release group match (${realDebridInfo.releaseGroup}): ${releaseBonus}% * 0.15`);
+            } else {
+                bonuses.push(`No release group match: 0% * 0.15`);
+            }
+        } else {
+            bonuses.push(`No release group info: 50% * 0.15`);
+            score += 50 * 0.15;
+        }
+
+        // 5. Title similarity (10% of score)
+        const titleScore = this.calculateTitleSimilarity(movieTitle, subtitleInfo.title || subtitleInfo.originalTitle);
+        score += titleScore * 0.1;
+        bonuses.push(`Title similarity: ${titleScore.toFixed(1)}% * 0.1`);
+
+        console.log(`[MATCHER-RD] Score breakdown: ${bonuses.join(', ')}`);
+        console.log(`[MATCHER-RD] Final RealDebrid compatibility score: ${score.toFixed(1)}%`);
+
+        return Math.min(100, Math.max(0, score));
     }
 
     // Extract video source from title
@@ -305,6 +615,55 @@ class SubtitleMatcher {
         return false;
     }
 
+    // Enhanced sorting with RealDebrid integration
+    sortSubtitlesByRealDebridRelevance(subtitles, realDebridInfo, movieTitle = '') {
+        console.log(`[MATCHER-RD] Sorting ${subtitles.length} subtitles by RealDebrid relevance`);
+        console.log(`[MATCHER-RD] RealDebrid file: "${realDebridInfo.originalTitle}"`);
+        console.log(`[MATCHER-RD] Movie title: "${movieTitle}"`);
+        
+        const scoredSubtitles = subtitles.map(subtitle => {
+            const subtitleInfo = this.extractVideoInfo(subtitle.videoVersion || subtitle.title);
+            const realDebridScore = this.calculateRealDebridCompatibilityScore(realDebridInfo, subtitleInfo, movieTitle);
+            const editionBonus = this.calculateSpecialEditionBonus(realDebridInfo, subtitleInfo);
+            
+            const finalScore = Math.min(100, realDebridScore + editionBonus);
+            
+            return {
+                ...subtitle,
+                realDebridScore: realDebridScore,
+                editionBonus: editionBonus,
+                finalScore: finalScore,
+                subtitleVideoInfo: subtitleInfo
+            };
+        });
+
+        // Sort by final score (descending), then by downloads (descending)
+        scoredSubtitles.sort((a, b) => {
+            // Primary sort: final score (higher is better)
+            const scoreDiff = b.finalScore - a.finalScore;
+            if (Math.abs(scoreDiff) >= 2) {
+                return scoreDiff;
+            }
+            
+            // Secondary sort: downloads (higher is better)
+            const downloadDiff = (b.downloads || 0) - (a.downloads || 0);
+            if (downloadDiff !== 0) {
+                return downloadDiff;
+            }
+            
+            // Tertiary sort: ID (for consistent ordering)
+            return (a.id || '').localeCompare(b.id || '');
+        });
+
+        console.log(`[MATCHER-RD] Top 6 RealDebrid matches:`);
+        scoredSubtitles.slice(0, 6).forEach((sub, i) => {
+            const editionInfo = sub.editionBonus !== 0 ? ` Edition: ${sub.editionBonus > 0 ? '+' : ''}${sub.editionBonus}%` : '';
+            console.log(`[MATCHER-RD] ${i+1}. "${sub.title}" - RDScore: ${sub.realDebridScore.toFixed(1)}%${editionInfo} - Final: ${sub.finalScore.toFixed(1)}% - Downloads: ${sub.downloads || 0}`);
+        });
+
+        return scoredSubtitles;
+    }
+
     // Sort subtitles by source relevance to video
     sortSubtitlesByRelevance(subtitles, videoInfo, movieTitle = '') {
         console.log(`[MATCHER] Sorting ${subtitles.length} subtitles by source relevance and title similarity`);
@@ -361,7 +720,7 @@ class SubtitleMatcher {
     }
 
     // Create enhanced subtitle name with source compatibility indicator
-    createEnhancedSubtitleName(subtitle, isTopMatch = false) {
+    createEnhancedSubtitleName(subtitle, isTopMatch = false, isRealDebridMatch = false) {
         let name = subtitle.title;
         
         // Add special edition info if detected
@@ -378,10 +737,16 @@ class SubtitleMatcher {
             }
         }
 
-        // Add compatibility indicator based on final score (including edition bonus)
-        const finalScore = subtitle.finalScore || subtitle.compatibilityScore;
+        // Add compatibility indicator based on final score
+        const finalScore = subtitle.finalScore || subtitle.compatibilityScore || subtitle.realDebridScore;
         
-        if (isTopMatch && finalScore >= 95) {
+        if (isRealDebridMatch && finalScore >= 95) {
+            name = `🎯🔥 ${name}`; // Perfect RealDebrid match
+        } else if (isRealDebridMatch && finalScore >= 90) {
+            name = `🎯⭐ ${name}`; // Excellent RealDebrid match
+        } else if (isRealDebridMatch && finalScore >= 80) {
+            name = `🎯✅ ${name}`; // Good RealDebrid match
+        } else if (isTopMatch && finalScore >= 95) {
             name = `🏆 ${name}`; // Perfect match with edition bonus
         } else if (finalScore >= 90) {
             name = `🎯 ${name}`; // Excellent match
@@ -395,7 +760,7 @@ class SubtitleMatcher {
 
         // Add edition bonus indicator for special editions
         if (subtitle.editionBonus && subtitle.editionBonus > 0) {
-            name = name.replace(/^(🏆|🎯|✅|📝|⚠️) /, '$1⭐ '); // Add star for edition bonus
+            name = name.replace(/^(🎯🔥|🎯⭐|🎯✅|🏆|🎯|✅|📝|⚠️) /, '$1⭐ '); // Add star for edition bonus
         }
 
         // Add author if available
@@ -491,7 +856,7 @@ const manifest = {
     id: 'com.titulky.subtitles',
     version: '1.0.0',
     name: 'Titulky.com Subtitles',
-    description: 'Czech and Slovak subtitles from Titulky.com',
+    description: 'Czech and Slovak subtitles from Titulky.com with RealDebrid integration',
     logo: 'https://www.titulky.com/favicon.ico',
     resources: ['subtitles'],
     types: ['movie', 'series'],
@@ -1188,7 +1553,7 @@ app.get('/', (req, res) => {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Titulky.com Stremio Addon</title>
+    <title>Titulky.com Stremio Addon s RealDebrid</title>
     <style>
         * {
             margin: 0;
@@ -1212,7 +1577,7 @@ app.get('/', (req, res) => {
             border-radius: 20px;
             padding: 40px;
             box-shadow: 0 20px 40px rgba(0, 0, 0, 0.1);
-            max-width: 500px;
+            max-width: 600px;
             width: 90%;
             text-align: center;
         }
@@ -1270,6 +1635,12 @@ app.get('/', (req, res) => {
             outline: none;
             border-color: #667eea;
             box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        }
+
+        .optional {
+            font-size: 0.9rem;
+            color: #888;
+            margin-left: 5px;
         }
 
         .btn {
@@ -1379,23 +1750,52 @@ app.get('/', (req, res) => {
             margin-top: 20px;
             color: #2e7d32;
         }
+
+        .realdebrid-section {
+            background: rgba(255, 152, 0, 0.1);
+            border: 2px solid #ff9800;
+            border-radius: 12px;
+            padding: 20px;
+            margin-top: 20px;
+            text-align: left;
+        }
+
+        .realdebrid-section h3 {
+            color: #f57c00;
+            margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .realdebrid-section .icon {
+            font-size: 1.5rem;
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="logo">T</div>
         <h1>Titulky.com</h1>
-        <p class="subtitle">Stremio Addon pro české a slovenské titulky</p>
+        <p class="subtitle">Stremio Addon pro české a slovenské titulky s RealDebrid integrací</p>
         
         <form id="configForm">
             <div class="form-group">
-                <label for="username">Uživatelské jméno:</label>
+                <label for="username">Uživatelské jméno na Titulky.com:</label>
                 <input type="text" id="username" name="username" required placeholder="Vaše uživatelské jméno na Titulky.com">
             </div>
             
             <div class="form-group">
-                <label for="password">Heslo:</label>
+                <label for="password">Heslo na Titulky.com:</label>
                 <input type="password" id="password" name="password" required placeholder="Vaše heslo">
+            </div>
+            
+            <div class="form-group">
+                <label for="realDebridKey">
+                    RealDebrid API klíč: 
+                    <span class="optional">(volitelné - pro lepší matching)</span>
+                </label>
+                <input type="text" id="realDebridKey" name="realDebridKey" placeholder="Váš RealDebrid API klíč">
             </div>
             
             <button type="submit" class="btn" id="submitBtn">
@@ -1414,6 +1814,17 @@ app.get('/', (req, res) => {
             </a>
         </div>
         
+        <div class="realdebrid-section">
+            <h3><span class="icon">🚀</span>RealDebrid Integrace (NOVÉ!)</h3>
+            <ul>
+                <li><strong>Chytré matching:</strong> Addon automaticky detekuje váš právě přehrávaný soubor z RealDebrid</li>
+                <li><strong>Přesné titulky:</strong> Seřadí titulky podle kvality, kodeku a release skupiny vašeho souboru</li>
+                <li><strong>Perfektní shoda:</strong> 🎯🔥 = perfektní shoda s RealDebrid souborem</li>
+                <li><strong>API klíč najdete:</strong> RealDebrid → Account → API Token</li>
+                <li><strong>Volitelné:</strong> Addon funguje i bez RealDebrid API klíče</li>
+            </ul>
+        </div>
+        
         <div class="keep-alive-status">
             <strong>🟢 Keep-Alive aktivní:</strong><br>
             Addon se automaticky udržuje při životě ping každých 13 minut pro Render.com hosting.
@@ -1428,12 +1839,12 @@ app.get('/', (req, res) => {
             <h3>📋 Instrukce:</h3>
             <ul>
                 <li>Zadejte své přihlašovací údaje k účtu na Titulky.com</li>
+                <li><strong>Volitelně:</strong> Přidejte RealDebrid API klíč pro chytré matching titulků</li>
                 <li>Klikněte na "Vytvořit konfiguraci"</li>
                 <li>Po úspěšném ověření klikněte na "Nainstalovat do Stremio"</li>
                 <li>Addon bude dostupný v sekci Addons ve Stremio</li>
                 <li>Titulky se automaticky zobrazí při přehrávání filmů a seriálů</li>
-                <li><strong>Keep-Alive:</strong> Addon se automaticky udržuje aktivní na Render.com</li>
-                <li><strong>Limit stažení:</strong> Po dosažení 25 stažení za den se zobrazí upozornění na 5 minut</li>
+                <li><strong>S RealDebrid:</strong> Titulky budou seřazeny podle vašeho aktuálního souboru</li>
             </ul>
         </div>
     </div>
@@ -1450,6 +1861,7 @@ app.get('/', (req, res) => {
             
             const username = document.getElementById('username').value;
             const password = document.getElementById('password').value;
+            const realDebridKey = document.getElementById('realDebridKey').value;
             
             // Show loading state
             submitBtn.style.display = 'none';
@@ -1462,16 +1874,27 @@ app.get('/', (req, res) => {
                     headers: {
                         'Content-Type': 'application/json',
                     },
-                    body: JSON.stringify({ username, password })
+                    body: JSON.stringify({ username, password, realDebridKey })
                 });
                 
                 const data = await response.json();
                 
                 if (response.ok && data.success) {
                     result.className = 'result success';
+                    
+                    let rdStatus = '';
+                    if (data.realDebridStatus) {
+                        if (data.realDebridStatus.valid) {
+                            rdStatus = \`<br><strong>🚀 RealDebrid:</strong> Aktivní pro uživatele \${data.realDebridStatus.username} (Premium: \${data.realDebridStatus.premium ? 'Ano' : 'Ne'})\`;
+                        } else {
+                            rdStatus = \`<br><strong>⚠️ RealDebrid:</strong> Neplatný API klíč\`;
+                        }
+                    }
+                    
                     resultMessage.innerHTML = \`
                         <strong>✅ Konfigurace úspěšně vytvořena!</strong><br>
-                        <br>
+                        \${rdStatus}
+                        <br><br>
                         <strong>📋 Kroky pro instalaci:</strong><br>
                         1. Zkopírujte URL níže<br>
                         2. Otevřete Stremio → Settings → Addons<br>
@@ -1509,7 +1932,7 @@ app.get('/', (req, res) => {
 
         document.getElementById('installLink').addEventListener('click', (e) => {
             setTimeout(() => {
-                alert('Addon byl úspěšně nainstalován! Můžete jej najít v sekci "Addons" ve Stremio.');
+                alert('Addon byl úspěšně nainstalován! S RealDebrid API budou titulky automaticky seřazeny podle vašeho přehrávaného souboru.');
             }, 1000);
         });
     </script>
@@ -1539,8 +1962,8 @@ app.get('/:config/manifest.json', (req, res) => {
         const configuredManifest = {
             ...manifest,
             id: `com.titulky.subtitles.${decodedConfig.username}`,
-            name: `Titulky.com CZ/SK`,
-            description: `${manifest.description}`
+            name: `Titulky.com CZ/SK${decodedConfig.realDebridKey ? ' + RealDebrid' : ''}`,
+            description: `${manifest.description}${decodedConfig.realDebridKey ? ' + Smart matching with RealDebrid' : ''}`
         };
         
         res.set({
@@ -1582,9 +2005,12 @@ app.get('/:config/subtitles/:type/:id*', async (req, res) => {
     
     try {
         const decodedConfig = JSON.parse(Buffer.from(config, 'base64').toString());
-        const { username, password } = decodedConfig;
+        const { username, password, realDebridKey } = decodedConfig;
 
         console.log(`[SUBTITLES] Decoded config for user: ${username}`);
+        if (realDebridKey) {
+            console.log(`[SUBTITLES] RealDebrid integration enabled`);
+        }
 
         if (!username || !password) {
             console.log('[SUBTITLES] Missing credentials in config');
@@ -1606,6 +2032,35 @@ app.get('/:config/subtitles/:type/:id*', async (req, res) => {
         } else {
             console.log(`[SUBTITLES] Using existing session for ${username}`);
             client.lastUsed = Date.now();
+        }
+
+        // Initialize RealDebrid client if API key is provided
+        let realDebridClient = null;
+        let realDebridInfo = null;
+        
+        if (realDebridKey) {
+            try {
+                realDebridClient = new RealDebridClient(realDebridKey);
+                
+                // Try to get currently playing file
+                realDebridInfo = await realDebridClient.getCurrentlyPlayingFile();
+                
+                if (!realDebridInfo) {
+                    // Fallback: try to get active streams
+                    realDebridInfo = await realDebridClient.getActiveStreams();
+                }
+                
+                if (realDebridInfo) {
+                    console.log(`[REALDEBRID] Found file: ${realDebridInfo.filename}`);
+                    // Extract detailed video info from RealDebrid filename
+                    realDebridInfo = subtitleMatcher.extractVideoInfoFromRealDebrid(realDebridInfo.filename);
+                } else {
+                    console.log(`[REALDEBRID] No current file found, using standard matching`);
+                }
+            } catch (rdError) {
+                console.error(`[REALDEBRID] Error: ${rdError.message}`);
+                // Continue without RealDebrid - don't fail the whole request
+            }
         }
 
         // Extract IMDB ID and get movie/series title from OMDB API
@@ -1729,38 +2184,45 @@ app.get('/:config/subtitles/:type/:id*', async (req, res) => {
 
         console.log(`[SUBTITLES] Total subtitles found: ${allSubtitles.length}`);
         
-        // Extract video source for matching
-        let videoInfo = { source: 'unknown' };
+        let sortedSubtitles;
         
-        try {
-            // Try to get video source from request headers or create default
-            const userAgent = req.get('User-Agent') || '';
-            const referrer = req.get('Referer') || '';
+        // Use RealDebrid enhanced matching if available
+        if (realDebridInfo && realDebridInfo.originalTitle) {
+            console.log(`[SUBTITLES] Using RealDebrid enhanced matching`);
+            sortedSubtitles = subtitleMatcher.sortSubtitlesByRealDebridRelevance(allSubtitles, realDebridInfo, movieInfo.title);
+        } else {
+            console.log(`[SUBTITLES] Using standard matching`);
             
-            // Create basic video info for source matching
-            let searchTitle = '';
-            if (type === 'movie') {
-                searchTitle = `${movieInfo.title} ${movieInfo.year}`;
-            } else {
-                searchTitle = `${movieInfo.title} S${season}E${episode}`;
+            // Extract video source for matching
+            let videoInfo = { source: 'unknown' };
+            
+            try {
+                // Create basic video info for source matching
+                let searchTitle = '';
+                if (type === 'movie') {
+                    searchTitle = `${movieInfo.title} ${movieInfo.year}`;
+                } else {
+                    searchTitle = `${movieInfo.title} S${season}E${episode}`;
+                }
+                
+                videoInfo = subtitleMatcher.extractVideoInfo(searchTitle);
+                
+                console.log(`[SUBTITLES] Using video source for matching: ${videoInfo.source}`);
+            } catch (error) {
+                console.log(`[SUBTITLES] Could not extract video source, using defaults`);
             }
-            
-            videoInfo = subtitleMatcher.extractVideoInfo(searchTitle);
-            
-            console.log(`[SUBTITLES] Using video source for matching: ${videoInfo.source}`);
-        } catch (error) {
-            console.log(`[SUBTITLES] Could not extract video source, using defaults`);
-        }
 
-        // Sort subtitles by source relevance to video
-        const sortedSubtitles = subtitleMatcher.sortSubtitlesByRelevance(allSubtitles, videoInfo, movieInfo.title);
+            // Sort subtitles by source relevance to video
+            sortedSubtitles = subtitleMatcher.sortSubtitlesByRelevance(allSubtitles, videoInfo, movieInfo.title);
+        }
         
         // Limit to top 6 results
         const topSubtitles = sortedSubtitles.slice(0, 6);
         
         const stremioSubtitles = topSubtitles.map((sub, index) => {
             const isTopMatch = index === 0;
-            const enhancedName = subtitleMatcher.createEnhancedSubtitleName(sub, isTopMatch);
+            const isRealDebridMatch = realDebridInfo && realDebridInfo.originalTitle;
+            const enhancedName = subtitleMatcher.createEnhancedSubtitleName(sub, isTopMatch, isRealDebridMatch);
 
             const subtitle = {
                 id: `${sub.id}:${sub.linkFile}`,
@@ -1768,14 +2230,19 @@ app.get('/:config/subtitles/:type/:id*', async (req, res) => {
                 lang: sub.language.toLowerCase() === 'czech' ? 'cs' : 
                       sub.language.toLowerCase() === 'slovak' ? 'sk' : 'cs',
                 name: enhancedName,
-                rating: Math.min(5, Math.max(1, Math.round((sub.finalScore || sub.compatibilityScore) / 20))) // Use final score
+                rating: Math.min(5, Math.max(1, Math.round((sub.finalScore || sub.compatibilityScore || sub.realDebridScore) / 20)))
             };
             
-            console.log(`[SUBTITLES] ${index + 1}. "${sub.title}" → ${subtitle.name} (Source: ${sub.compatibilityScore}%, Title: ${sub.titleSimilarity?.toFixed(1) || 'N/A'}%, Final: ${sub.finalScore?.toFixed(1) || 'N/A'}%, Rating: ${subtitle.rating})`);
+            if (isRealDebridMatch) {
+                console.log(`[SUBTITLES] ${index + 1}. "${sub.title}" → ${subtitle.name} (RD: ${sub.realDebridScore?.toFixed(1) || 'N/A'}%, Final: ${sub.finalScore?.toFixed(1) || 'N/A'}%, Rating: ${subtitle.rating})`);
+            } else {
+                console.log(`[SUBTITLES] ${index + 1}. "${sub.title}" → ${subtitle.name} (Source: ${sub.compatibilityScore}%, Title: ${sub.titleSimilarity?.toFixed(1) || 'N/A'}%, Final: ${sub.finalScore?.toFixed(1) || 'N/A'}%, Rating: ${subtitle.rating})`);
+            }
             return subtitle;
         });
 
-        console.log(`[SUBTITLES] Returning ${stremioSubtitles.length} source-matched subtitles to Stremio`);
+        const matchingType = realDebridInfo && realDebridInfo.originalTitle ? 'RealDebrid-enhanced' : 'standard';
+        console.log(`[SUBTITLES] Returning ${stremioSubtitles.length} ${matchingType} matched subtitles to Stremio`);
         res.json({ subtitles: stremioSubtitles });
         
     } catch (error) {
@@ -1888,7 +2355,7 @@ app.get('/:config/subtitle/:id/:linkFile', async (req, res) => {
 });
 
 app.post('/configure', async (req, res) => {
-    const { username, password } = req.body;
+    const { username, password, realDebridKey } = req.body;
     
     if (!username || !password) {
         return res.status(400).json({ error: 'Username and password required' });
@@ -1900,7 +2367,7 @@ app.post('/configure', async (req, res) => {
         const loginSuccess = await testClient.login(username, password);
         
         if (!loginSuccess) {
-            return res.status(401).json({ error: 'Neplatné přihlašovací údaje' });
+            return res.status(401).json({ error: 'Neplatné přihlašovací údaje pro Titulky.com' });
         }
         
         // Store successful session
@@ -1909,25 +2376,123 @@ app.post('/configure', async (req, res) => {
         
     } catch (error) {
         console.error('Login test error:', error.message);
-        return res.status(500).json({ error: 'Chyba při ověřování přihlašovacích údajů' });
+        return res.status(500).json({ error: 'Chyba při ověřování přihlašovacích údajů na Titulky.com' });
     }
 
-    const config = Buffer.from(JSON.stringify({ username, password })).toString('base64');
+    // Test RealDebrid API key if provided
+    let realDebridStatus = null;
+    if (realDebridKey && realDebridKey.trim()) {
+        try {
+            const realDebridClient = new RealDebridClient(realDebridKey.trim());
+            realDebridStatus = await realDebridClient.testApiKey();
+            console.log(`[CONFIGURE] RealDebrid API test result:`, realDebridStatus);
+        } catch (rdError) {
+            console.error('RealDebrid API test error:', rdError.message);
+            realDebridStatus = { valid: false, error: rdError.message };
+        }
+    }
+
+    const configData = { username, password };
+    if (realDebridKey && realDebridKey.trim()) {
+        configData.realDebridKey = realDebridKey.trim();
+    }
+
+    const config = Buffer.from(JSON.stringify(configData)).toString('base64');
     
     // Create both stremio:// and https:// URLs for testing
     const baseUrl = req.get('host');
     const installUrl = `stremio://${baseUrl}/${config}/manifest.json`;
     const testUrl = `${req.protocol}://${baseUrl}/${config}/manifest.json`;
     
-    console.log(`[CONFIGURE] Created config for ${username}, config: ${config.substring(0, 20)}...`);
+    console.log(`[CONFIGURE] Created config for ${username}${realDebridKey ? ' with RealDebrid' : ''}, config: ${config.substring(0, 20)}...`);
     
     res.json({ 
         success: true, 
         installUrl,
         testUrl,
         config: config,
+        realDebridStatus: realDebridStatus,
         message: 'Configuration created successfully'
     });
+});
+
+// Test RealDebrid API endpoint
+app.post('/test-realdebrid', async (req, res) => {
+    const { apiKey } = req.body;
+    
+    if (!apiKey) {
+        return res.status(400).json({ error: 'API key required' });
+    }
+
+    try {
+        const realDebridClient = new RealDebridClient(apiKey);
+        const result = await realDebridClient.testApiKey();
+        
+        if (result.valid) {
+            // Also try to get current file info
+            const currentFile = await realDebridClient.getCurrentlyPlayingFile();
+            const activeStreams = await realDebridClient.getActiveStreams();
+            
+            res.json({
+                success: true,
+                ...result,
+                currentFile: currentFile,
+                activeStreams: activeStreams
+            });
+        } else {
+            res.status(401).json({
+                success: false,
+                error: result.error || 'Invalid API key'
+            });
+        }
+    } catch (error) {
+        console.error('RealDebrid test error:', error.message);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// Optional: Add endpoint to test RealDebrid matching
+app.get('/test-realdebrid-matching/:config', async (req, res) => {
+    const { config } = req.params;
+    
+    try {
+        const decodedConfig = JSON.parse(Buffer.from(config, 'base64').toString());
+        const { username, realDebridKey } = decodedConfig;
+
+        if (!realDebridKey) {
+            return res.status(400).json({ error: 'No RealDebrid API key in config' });
+        }
+
+        const client = userSessions.get(username);
+        if (!client) {
+            return res.status(401).json({ error: 'Session expired' });
+        }
+
+        const realDebridClient = new RealDebridClient(realDebridKey);
+        const currentFile = await realDebridClient.getCurrentlyPlayingFile();
+        const activeStreams = await realDebridClient.getActiveStreams();
+        
+        let realDebridInfo = null;
+        if (currentFile) {
+            realDebridInfo = subtitleMatcher.extractVideoInfoFromRealDebrid(currentFile.filename);
+        } else if (activeStreams) {
+            realDebridInfo = subtitleMatcher.extractVideoInfoFromRealDebrid(activeStreams.filename);
+        }
+
+        res.json({
+            success: true,
+            currentFile: currentFile,
+            activeStreams: activeStreams,
+            extractedInfo: realDebridInfo,
+            hasActiveContent: !!(currentFile || activeStreams)
+        });
+    } catch (error) {
+        console.error('[TEST-RD-MATCHING] Error:', error.message);
+        res.status(500).json({ error: error.message });
+    }
 });
 
 // Optional: Add endpoint to test source matching
@@ -1966,6 +2531,7 @@ app.get('/test-matching/:config/:videoTitle', async (req, res) => {
         res.status(500).json({ error: error.message });
     }
 });
+
 app.get('/test/:config/:query', async (req, res) => {
     const { config, query } = req.params;
     
@@ -2020,7 +2586,11 @@ app.get('/health', (req, res) => {
             interval: '13 minutes',
             purpose: 'Prevent Render.com sleep'
         },
-        version: '1.0.2'
+        realDebridIntegration: {
+            enabled: true,
+            features: ['smart_matching', 'file_detection', 'quality_matching']
+        },
+        version: '1.1.0'
     });
 });
 
@@ -2071,10 +2641,12 @@ setInterval(() => {
 }, 60 * 60 * 1000);
 
 app.listen(PORT, () => {
-    console.log(`Titulky.com Stremio Addon running on port ${PORT}`);
+    console.log(`Titulky.com Stremio Addon with RealDebrid integration running on port ${PORT}`);
     console.log(`Manifest URL: http://localhost:${PORT}/manifest.json`);
     console.log(`Health check: http://localhost:${PORT}/health`);
     console.log(`Ping endpoint: http://localhost:${PORT}/ping`);
+    console.log('🚀 RealDebrid integration enabled');
+    console.log('🎯 Smart subtitle matching active');
     console.log('Debug logging enabled');
     console.log('CAPTCHA fallback functionality active');
     
