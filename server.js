@@ -1,4 +1,15 @@
-/*
+// Create enhanced subtitle name with technical compatibility indicator
+    createEnhancedSubtitleName(subtitle, isTopMatch = false, isTechnicalMatch = false) {
+        let name = subtitle.title;
+        
+        // Add special edition info if detected
+        if (subtitle.subtitleVideoInfo && subtitle.subtitleVideoInfo.specialEdition) {
+            const edition = subtitle.subtitleVideoInfo.specialEdition.toUpperCase().replace('-', ' ');
+            name += ` [${edition}]`;
+        }
+        
+        // Add source info if available
+        if (subtitle.videoVersion && !name/*
 PACKAGE.JSON DEPENDENCIES:
 {
   "name": "stremio-titulky-addon",
@@ -81,7 +92,9 @@ class RealDebridClient {
                 return {
                     filename: recentFile.filename,
                     generated: recentFile.generated,
-                    size: recentFile.filesize
+                    size: recentFile.filesize,
+                    // Extract only technical metadata, not movie title
+                    technicalOnly: true
                 };
             }
 
@@ -188,9 +201,9 @@ class SubtitleMatcher {
         ];
     }
 
-    // Extract video info from RealDebrid filename or stream title
-    extractVideoInfoFromRealDebrid(filename) {
-        console.log(`[MATCHER-RD] Analyzing RealDebrid file: "${filename}"`);
+    // Extract technical video info from RealDebrid filename (only technical metadata)
+    extractTechnicalInfoFromRealDebrid(filename) {
+        console.log(`[MATCHER-RD] Extracting technical info from: "${filename}"`);
         
         const info = {
             source: this.extractSource(filename),
@@ -199,11 +212,169 @@ class SubtitleMatcher {
             audio: this.extractAudio(filename),
             specialEdition: this.extractSpecialEdition(filename),
             releaseGroup: this.extractReleaseGroup(filename),
-            originalTitle: filename
+            originalFilename: filename,
+            technicalOnly: true // Flag indicating we only extracted technical data
         };
 
-        console.log(`[MATCHER-RD] Extracted info:`, info);
+        console.log(`[MATCHER-RD] Extracted technical info:`, {
+            source: info.source,
+            quality: info.quality,
+            codec: info.codec,
+            audio: info.audio,
+            specialEdition: info.specialEdition,
+            releaseGroup: info.releaseGroup
+        });
+        
         return info;
+    }
+
+    // Estimate release type from file size (when RealDebrid is not available)
+    estimateReleaseTypeFromSize(fileSizeBytes, quality = '1080p', duration = 120) {
+        console.log(`[MATCHER-SIZE] Estimating release type for ${fileSizeBytes} bytes, ${quality}, ~${duration}min`);
+        
+        if (!fileSizeBytes || fileSizeBytes <= 0) {
+            console.log(`[MATCHER-SIZE] Invalid file size, returning unknown`);
+            return { source: 'unknown', confidence: 0 };
+        }
+
+        const sizeGB = fileSizeBytes / (1024 * 1024 * 1024);
+        const durationHours = duration / 60;
+        
+        console.log(`[MATCHER-SIZE] File size: ${sizeGB.toFixed(2)} GB, Duration: ${durationHours.toFixed(1)}h`);
+
+        // Size ranges for different release types (per hour of content)
+        const sizeRanges = {
+            '2160p': {
+                'remux': { min: 25, max: 80, confidence: 90 },
+                'bdrip': { min: 8, max: 25, confidence: 85 },
+                'web-dl': { min: 6, max: 15, confidence: 80 },
+                'webrip': { min: 4, max: 10, confidence: 75 }
+            },
+            '1080p': {
+                'remux': { min: 15, max: 50, confidence: 90 },
+                'bdrip': { min: 4, max: 15, confidence: 85 },
+                'web-dl': { min: 3, max: 8, confidence: 80 },
+                'webrip': { min: 2, max: 6, confidence: 75 },
+                'hdtv': { min: 1, max: 4, confidence: 70 }
+            },
+            '720p': {
+                'bdrip': { min: 2, max: 8, confidence: 85 },
+                'web-dl': { min: 1.5, max: 4, confidence: 80 },
+                'webrip': { min: 1, max: 3, confidence: 75 },
+                'hdtv': { min: 0.5, max: 2, confidence: 70 }
+            },
+            '480p': {
+                'dvdrip': { min: 0.7, max: 2, confidence: 80 },
+                'webrip': { min: 0.3, max: 1, confidence: 75 },
+                'hdtv': { min: 0.2, max: 0.8, confidence: 70 }
+            }
+        };
+
+        const normalizedQuality = quality.toLowerCase();
+        const qualityRanges = sizeRanges[normalizedQuality] || sizeRanges['1080p'];
+        
+        const sizePerHour = sizeGB / Math.max(durationHours, 0.5); // Minimum 30 min
+        console.log(`[MATCHER-SIZE] Size per hour: ${sizePerHour.toFixed(2)} GB/h`);
+
+        let bestMatch = { source: 'unknown', confidence: 0 };
+
+        for (const [source, range] of Object.entries(qualityRanges)) {
+            if (sizePerHour >= range.min && sizePerHour <= range.max) {
+                // Calculate confidence based on how well the size fits the range
+                const rangeMid = (range.min + range.max) / 2;
+                const deviation = Math.abs(sizePerHour - rangeMid) / (range.max - range.min);
+                const adjustedConfidence = range.confidence * (1 - deviation);
+                
+                if (adjustedConfidence > bestMatch.confidence) {
+                    bestMatch = { source, confidence: adjustedConfidence };
+                }
+                
+                console.log(`[MATCHER-SIZE] ${source}: fits range ${range.min}-${range.max} GB/h, confidence: ${adjustedConfidence.toFixed(1)}%`);
+            }
+        }
+
+        // Special cases for very small or very large files
+        if (sizePerHour < 0.5) {
+            bestMatch = { source: 'cam', confidence: 60 };
+            console.log(`[MATCHER-SIZE] Very small file, likely CAM`);
+        } else if (sizePerHour > 50) {
+            bestMatch = { source: 'remux', confidence: 85 };
+            console.log(`[MATCHER-SIZE] Very large file, likely REMUX`);
+        }
+
+        console.log(`[MATCHER-SIZE] Best estimate: ${bestMatch.source} (confidence: ${bestMatch.confidence.toFixed(1)}%)`);
+        
+        return bestMatch;
+    }
+
+    // Create video info from Stremio request data and optional RealDebrid info
+    createVideoInfoFromStremio(stremioData, realDebridTechnical = null) {
+        console.log(`[MATCHER-STREMIO] Creating video info from Stremio data`);
+        
+        let videoInfo = {
+            source: 'unknown',
+            quality: 'unknown',
+            codec: 'unknown',
+            audio: 'unknown',
+            specialEdition: null,
+            releaseGroup: 'unknown',
+            confidence: 0,
+            dataSource: 'estimated'
+        };
+
+        // If we have RealDebrid technical data, use that (most accurate)
+        if (realDebridTechnical && realDebridTechnical.technicalOnly) {
+            console.log(`[MATCHER-STREMIO] Using RealDebrid technical data`);
+            videoInfo = {
+                source: realDebridTechnical.source,
+                quality: realDebridTechnical.quality,
+                codec: realDebridTechnical.codec,
+                audio: realDebridTechnical.audio,
+                specialEdition: realDebridTechnical.specialEdition,
+                releaseGroup: realDebridTechnical.releaseGroup,
+                confidence: 95,
+                dataSource: 'realdebrid'
+            };
+        } 
+        // Otherwise estimate from file size and other Stremio data
+        else if (stremioData.fileSize) {
+            console.log(`[MATCHER-STREMIO] Estimating from file size: ${stremioData.fileSize} bytes`);
+            
+            const sizeEstimate = this.estimateReleaseTypeFromSize(
+                stremioData.fileSize,
+                stremioData.quality || '1080p',
+                stremioData.duration || 120
+            );
+            
+            videoInfo.source = sizeEstimate.source;
+            videoInfo.confidence = sizeEstimate.confidence;
+            videoInfo.dataSource = 'size_estimate';
+            
+            // Try to extract quality and other info from stream title if available
+            if (stremioData.streamTitle) {
+                const extractedInfo = this.extractVideoInfo(stremioData.streamTitle);
+                videoInfo.quality = this.extractQuality(stremioData.streamTitle) || videoInfo.quality;
+                videoInfo.codec = this.extractCodec(stremioData.streamTitle) || videoInfo.codec;
+                videoInfo.specialEdition = extractedInfo.specialEdition || videoInfo.specialEdition;
+            }
+        }
+        // Last resort: try to extract from stream title only
+        else if (stremioData.streamTitle) {
+            console.log(`[MATCHER-STREMIO] Extracting from stream title only`);
+            const extractedInfo = this.extractVideoInfo(stremioData.streamTitle);
+            videoInfo = {
+                ...extractedInfo,
+                quality: this.extractQuality(stremioData.streamTitle),
+                codec: this.extractCodec(stremioData.streamTitle),
+                audio: this.extractAudio(stremioData.streamTitle),
+                releaseGroup: this.extractReleaseGroup(stremioData.streamTitle),
+                confidence: 50,
+                dataSource: 'stream_title'
+            };
+        }
+
+        console.log(`[MATCHER-STREMIO] Final video info:`, videoInfo);
+        return videoInfo;
     }
 
     // Extract quality from filename
@@ -298,91 +469,117 @@ class SubtitleMatcher {
         return 'unknown';
     }
 
-    // Calculate enhanced compatibility score with RealDebrid info
-    calculateRealDebridCompatibilityScore(realDebridInfo, subtitleInfo, movieTitle = '') {
-        console.log(`[MATCHER-RD] Calculating RealDebrid compatibility`);
-        console.log(`[MATCHER-RD] RD file: "${realDebridInfo.originalTitle}"`);
-        console.log(`[MATCHER-RD] Subtitle: "${subtitleInfo.originalTitle || subtitleInfo.title}"`);
+    // Calculate enhanced compatibility score with technical video info
+    calculateTechnicalCompatibilityScore(videoInfo, subtitleInfo, movieTitle = '') {
+        console.log(`[MATCHER-TECH] Calculating technical compatibility`);
+        console.log(`[MATCHER-TECH] Video info:`, {
+            source: videoInfo.source,
+            quality: videoInfo.quality,
+            codec: videoInfo.codec,
+            confidence: videoInfo.confidence,
+            dataSource: videoInfo.dataSource
+        });
+        console.log(`[MATCHER-TECH] Subtitle: "${subtitleInfo.originalTitle || subtitleInfo.title}"`);
 
         let score = 0;
         let bonuses = [];
+        let confidence = videoInfo.confidence || 50;
+
+        // Weight the scoring based on confidence of video info
+        const confidenceMultiplier = confidence / 100;
 
         // 1. Source compatibility (40% of score)
-        const sourceScore = this.calculateCompatibilityScore(realDebridInfo, subtitleInfo, movieTitle);
-        score += sourceScore * 0.4;
-        bonuses.push(`Source: ${sourceScore.toFixed(1)}% * 0.4`);
+        const sourceScore = this.calculateCompatibilityScore(videoInfo, subtitleInfo, movieTitle);
+        const weightedSourceScore = sourceScore * 0.4 * confidenceMultiplier;
+        score += weightedSourceScore;
+        bonuses.push(`Source: ${sourceScore.toFixed(1)}% * 0.4 * ${confidenceMultiplier.toFixed(2)} = ${weightedSourceScore.toFixed(1)}`);
 
-        // 2. Quality match (20% of score)
-        if (realDebridInfo.quality !== 'unknown' && subtitleInfo.originalTitle) {
+        // 2. Quality match (25% of score)
+        if (videoInfo.quality !== 'unknown' && subtitleInfo.originalTitle) {
             const subtitleLower = subtitleInfo.originalTitle.toLowerCase();
-            if (subtitleLower.includes(realDebridInfo.quality)) {
-                const qualityBonus = 100;
-                score += qualityBonus * 0.2;
-                bonuses.push(`Quality match (${realDebridInfo.quality}): ${qualityBonus}% * 0.2`);
+            if (subtitleLower.includes(videoInfo.quality)) {
+                const qualityBonus = 100 * 0.25 * confidenceMultiplier;
+                score += qualityBonus;
+                bonuses.push(`Quality match (${videoInfo.quality}): 100% * 0.25 * ${confidenceMultiplier.toFixed(2)} = ${qualityBonus.toFixed(1)}`);
             } else {
                 // Check for compatible qualities
                 const qualityMap = {
-                    '2160p': ['4k', '2160p'],
-                    '1080p': ['1080p', 'fhd'],
+                    '2160p': ['4k', '2160p', 'uhd'],
+                    '1080p': ['1080p', 'fhd', 'fullhd'],
                     '720p': ['720p', 'hd'],
                     '480p': ['480p', 'sd']
                 };
                 
-                const compatibleQualities = qualityMap[realDebridInfo.quality] || [];
+                const compatibleQualities = qualityMap[videoInfo.quality] || [];
                 const hasCompatibleQuality = compatibleQualities.some(q => subtitleLower.includes(q));
                 
                 if (hasCompatibleQuality) {
-                    const compatibleBonus = 80;
-                    score += compatibleBonus * 0.2;
-                    bonuses.push(`Compatible quality: ${compatibleBonus}% * 0.2`);
+                    const compatibleBonus = 80 * 0.25 * confidenceMultiplier;
+                    score += compatibleBonus;
+                    bonuses.push(`Compatible quality: 80% * 0.25 * ${confidenceMultiplier.toFixed(2)} = ${compatibleBonus.toFixed(1)}`);
                 } else {
-                    bonuses.push(`No quality match: 0% * 0.2`);
+                    bonuses.push(`No quality match: 0%`);
                 }
             }
         } else {
-            bonuses.push(`No quality info: 50% * 0.2`);
-            score += 50 * 0.2;
+            const defaultBonus = 50 * 0.25;
+            score += defaultBonus;
+            bonuses.push(`No quality info: 50% * 0.25 = ${defaultBonus.toFixed(1)}`);
         }
 
-        // 3. Codec match (15% of score)
-        if (realDebridInfo.codec !== 'unknown' && subtitleInfo.originalTitle) {
+        // 3. Codec match (15% of score) - only if we have high confidence
+        if (videoInfo.codec !== 'unknown' && subtitleInfo.originalTitle && confidence > 70) {
             const subtitleLower = subtitleInfo.originalTitle.toLowerCase();
-            if (subtitleLower.includes(realDebridInfo.codec)) {
-                const codecBonus = 100;
-                score += codecBonus * 0.15;
-                bonuses.push(`Codec match (${realDebridInfo.codec}): ${codecBonus}% * 0.15`);
+            if (subtitleLower.includes(videoInfo.codec.toLowerCase())) {
+                const codecBonus = 100 * 0.15 * confidenceMultiplier;
+                score += codecBonus;
+                bonuses.push(`Codec match (${videoInfo.codec}): 100% * 0.15 * ${confidenceMultiplier.toFixed(2)} = ${codecBonus.toFixed(1)}`);
             } else {
-                bonuses.push(`No codec match: 0% * 0.15`);
+                bonuses.push(`No codec match: 0%`);
             }
         } else {
-            bonuses.push(`No codec info: 50% * 0.15`);
-            score += 50 * 0.15;
+            const defaultBonus = 50 * 0.15;
+            score += defaultBonus;
+            bonuses.push(`No codec info: 50% * 0.15 = ${defaultBonus.toFixed(1)}`);
         }
 
-        // 4. Release group match (15% of score)
-        if (realDebridInfo.releaseGroup !== 'unknown' && subtitleInfo.originalTitle) {
+        // 4. Release group match (10% of score) - only for RealDebrid data
+        if (videoInfo.releaseGroup !== 'unknown' && subtitleInfo.originalTitle && videoInfo.dataSource === 'realdebrid') {
             const subtitleLower = subtitleInfo.originalTitle.toLowerCase();
-            const releaseGroupLower = realDebridInfo.releaseGroup.toLowerCase();
+            const releaseGroupLower = videoInfo.releaseGroup.toLowerCase();
             
             if (subtitleLower.includes(releaseGroupLower)) {
-                const releaseBonus = 100;
-                score += releaseBonus * 0.15;
-                bonuses.push(`Release group match (${realDebridInfo.releaseGroup}): ${releaseBonus}% * 0.15`);
+                const releaseBonus = 100 * 0.1;
+                score += releaseBonus;
+                bonuses.push(`Release group match (${videoInfo.releaseGroup}): 100% * 0.1 = ${releaseBonus.toFixed(1)}`);
             } else {
-                bonuses.push(`No release group match: 0% * 0.15`);
+                bonuses.push(`No release group match: 0%`);
             }
         } else {
-            bonuses.push(`No release group info: 50% * 0.15`);
-            score += 50 * 0.15;
+            const defaultBonus = 50 * 0.1;
+            score += defaultBonus;
+            bonuses.push(`No release group info: 50% * 0.1 = ${defaultBonus.toFixed(1)}`);
         }
 
         // 5. Title similarity (10% of score)
         const titleScore = this.calculateTitleSimilarity(movieTitle, subtitleInfo.title || subtitleInfo.originalTitle);
-        score += titleScore * 0.1;
-        bonuses.push(`Title similarity: ${titleScore.toFixed(1)}% * 0.1`);
+        const titleBonus = titleScore * 0.1;
+        score += titleBonus;
+        bonuses.push(`Title similarity: ${titleScore.toFixed(1)}% * 0.1 = ${titleBonus.toFixed(1)}`);
 
-        console.log(`[MATCHER-RD] Score breakdown: ${bonuses.join(', ')}`);
-        console.log(`[MATCHER-RD] Final RealDebrid compatibility score: ${score.toFixed(1)}%`);
+        // Data source bonus - prefer RealDebrid data
+        if (videoInfo.dataSource === 'realdebrid') {
+            const dataSourceBonus = 5;
+            score += dataSourceBonus;
+            bonuses.push(`RealDebrid data bonus: +${dataSourceBonus}`);
+        } else if (videoInfo.dataSource === 'size_estimate' && confidence > 60) {
+            const dataSourceBonus = 2;
+            score += dataSourceBonus;
+            bonuses.push(`Size estimate bonus: +${dataSourceBonus}`);
+        }
+
+        console.log(`[MATCHER-TECH] Score breakdown: ${bonuses.join(', ')}`);
+        console.log(`[MATCHER-TECH] Final technical compatibility score: ${score.toFixed(1)}% (confidence: ${confidence}%)`);
 
         return Math.min(100, Math.max(0, score));
     }
@@ -615,22 +812,22 @@ class SubtitleMatcher {
         return false;
     }
 
-    // Enhanced sorting with RealDebrid integration
-    sortSubtitlesByRealDebridRelevance(subtitles, realDebridInfo, movieTitle = '') {
-        console.log(`[MATCHER-RD] Sorting ${subtitles.length} subtitles by RealDebrid relevance`);
-        console.log(`[MATCHER-RD] RealDebrid file: "${realDebridInfo.originalTitle}"`);
-        console.log(`[MATCHER-RD] Movie title: "${movieTitle}"`);
+    // Enhanced sorting with technical video info
+    sortSubtitlesByTechnicalRelevance(subtitles, videoInfo, movieTitle = '') {
+        console.log(`[MATCHER-TECH] Sorting ${subtitles.length} subtitles by technical relevance`);
+        console.log(`[MATCHER-TECH] Video source: ${videoInfo.source} (${videoInfo.dataSource}, confidence: ${videoInfo.confidence}%)`);
+        console.log(`[MATCHER-TECH] Movie title: "${movieTitle}"`);
         
         const scoredSubtitles = subtitles.map(subtitle => {
             const subtitleInfo = this.extractVideoInfo(subtitle.videoVersion || subtitle.title);
-            const realDebridScore = this.calculateRealDebridCompatibilityScore(realDebridInfo, subtitleInfo, movieTitle);
-            const editionBonus = this.calculateSpecialEditionBonus(realDebridInfo, subtitleInfo);
+            const technicalScore = this.calculateTechnicalCompatibilityScore(videoInfo, subtitleInfo, movieTitle);
+            const editionBonus = this.calculateSpecialEditionBonus(videoInfo, subtitleInfo);
             
-            const finalScore = Math.min(100, realDebridScore + editionBonus);
+            const finalScore = Math.min(100, technicalScore + editionBonus);
             
             return {
                 ...subtitle,
-                realDebridScore: realDebridScore,
+                technicalScore: technicalScore,
                 editionBonus: editionBonus,
                 finalScore: finalScore,
                 subtitleVideoInfo: subtitleInfo
@@ -655,10 +852,10 @@ class SubtitleMatcher {
             return (a.id || '').localeCompare(b.id || '');
         });
 
-        console.log(`[MATCHER-RD] Top 6 RealDebrid matches:`);
+        console.log(`[MATCHER-TECH] Top 6 technical matches:`);
         scoredSubtitles.slice(0, 6).forEach((sub, i) => {
             const editionInfo = sub.editionBonus !== 0 ? ` Edition: ${sub.editionBonus > 0 ? '+' : ''}${sub.editionBonus}%` : '';
-            console.log(`[MATCHER-RD] ${i+1}. "${sub.title}" - RDScore: ${sub.realDebridScore.toFixed(1)}%${editionInfo} - Final: ${sub.finalScore.toFixed(1)}% - Downloads: ${sub.downloads || 0}`);
+            console.log(`[MATCHER-TECH] ${i+1}. "${sub.title}" - TechScore: ${sub.technicalScore.toFixed(1)}%${editionInfo} - Final: ${sub.finalScore.toFixed(1)}% - Downloads: ${sub.downloads || 0}`);
         });
 
         return scoredSubtitles;
@@ -719,8 +916,8 @@ class SubtitleMatcher {
         return scoredSubtitles;
     }
 
-    // Create enhanced subtitle name with source compatibility indicator
-    createEnhancedSubtitleName(subtitle, isTopMatch = false, isRealDebridMatch = false) {
+    // Create enhanced subtitle name with technical compatibility indicator
+    createEnhancedSubtitleName(subtitle, isTopMatch = false, isTechnicalMatch = false) {
         let name = subtitle.title;
         
         // Add special edition info if detected
@@ -738,14 +935,14 @@ class SubtitleMatcher {
         }
 
         // Add compatibility indicator based on final score
-        const finalScore = subtitle.finalScore || subtitle.compatibilityScore || subtitle.realDebridScore;
+        const finalScore = subtitle.finalScore || subtitle.compatibilityScore || subtitle.technicalScore;
         
-        if (isRealDebridMatch && finalScore >= 95) {
-            name = `🎯🔥 ${name}`; // Perfect RealDebrid match
-        } else if (isRealDebridMatch && finalScore >= 90) {
-            name = `🎯⭐ ${name}`; // Excellent RealDebrid match
-        } else if (isRealDebridMatch && finalScore >= 80) {
-            name = `🎯✅ ${name}`; // Good RealDebrid match
+        if (isTechnicalMatch && finalScore >= 95) {
+            name = `🎯🔥 ${name}`; // Perfect technical match
+        } else if (isTechnicalMatch && finalScore >= 90) {
+            name = `🎯⭐ ${name}`; // Excellent technical match
+        } else if (isTechnicalMatch && finalScore >= 80) {
+            name = `🎯✅ ${name}`; // Good technical match
         } else if (isTopMatch && finalScore >= 95) {
             name = `🏆 ${name}`; // Perfect match with edition bonus
         } else if (finalScore >= 90) {
@@ -2036,24 +2233,31 @@ app.get('/:config/subtitles/:type/:id*', async (req, res) => {
 
         // Initialize RealDebrid client if API key is provided
         let realDebridClient = null;
-        let realDebridInfo = null;
+        let realDebridTechnical = null;
         
         if (realDebridKey) {
             try {
                 realDebridClient = new RealDebridClient(realDebridKey);
                 
                 // Try to get currently playing file
-                realDebridInfo = await realDebridClient.getCurrentlyPlayingFile();
+                const realDebridFile = await realDebridClient.getCurrentlyPlayingFile();
                 
-                if (!realDebridInfo) {
+                if (!realDebridFile) {
                     // Fallback: try to get active streams
-                    realDebridInfo = await realDebridClient.getActiveStreams();
+                    const activeStream = await realDebridClient.getActiveStreams();
+                    if (activeStream) {
+                        realDebridFile = {
+                            filename: activeStream.filename,
+                            size: 0, // Size not available from active streams
+                            technicalOnly: true
+                        };
+                    }
                 }
                 
-                if (realDebridInfo) {
-                    console.log(`[REALDEBRID] Found file: ${realDebridInfo.filename}`);
-                    // Extract detailed video info from RealDebrid filename
-                    realDebridInfo = subtitleMatcher.extractVideoInfoFromRealDebrid(realDebridInfo.filename);
+                if (realDebridFile && realDebridFile.filename) {
+                    console.log(`[REALDEBRID] Found file: ${realDebridFile.filename}`);
+                    // Extract only technical metadata from RealDebrid filename
+                    realDebridTechnical = subtitleMatcher.extractTechnicalInfoFromRealDebrid(realDebridFile.filename);
                 } else {
                     console.log(`[REALDEBRID] No current file found, using standard matching`);
                 }
@@ -2082,12 +2286,45 @@ app.get('/:config/subtitles/:type/:id*', async (req, res) => {
 
         console.log(`[SUBTITLES] IMDB ID: ${baseImdbId}`);
         
-        // Get movie/series title from OMDB API
+        // Get movie/series title from OMDB API (this is where we get the real movie name)
         const movieInfo = await getMovieTitle(baseImdbId);
         if (!movieInfo) {
             console.log(`[SUBTITLES] Could not get title for IMDB ${baseImdbId}`);
             return res.json({ subtitles: [] });
         }
+
+        // Extract potential file size and other info from Stremio request headers
+        const stremioData = {
+            movieTitle: movieInfo.title,
+            year: movieInfo.year,
+            type: type,
+            season: season,
+            episode: episode,
+            fileSize: null, // Will try to extract from headers
+            streamTitle: null, // Not available in subtitle requests
+            quality: null, // Will try to estimate
+            duration: null // Will try to estimate based on type
+        };
+
+        // Try to extract file size from request headers if available
+        const contentLength = req.get('content-length');
+        const userAgent = req.get('user-agent') || '';
+        const referer = req.get('referer') || '';
+        
+        // Look for size hints in headers (some Stremio clients include this)
+        if (contentLength) {
+            stremioData.fileSize = parseInt(contentLength);
+            console.log(`[SUBTITLES] Found file size in headers: ${stremioData.fileSize} bytes`);
+        }
+
+        // Estimate duration based on content type
+        if (type === 'movie') {
+            stremioData.duration = 120; // Average movie duration in minutes
+        } else if (type === 'series') {
+            stremioData.duration = 45; // Average episode duration in minutes
+        }
+
+        console.log(`[SUBTITLES] Stremio data:`, stremioData);
         
         // Check if captcha was detected in previous requests
         if (client.captchaDetected) {
@@ -2108,7 +2345,7 @@ app.get('/:config/subtitles/:type/:id*', async (req, res) => {
             return res.json({ subtitles: [fallbackSubtitle] });
         }
         
-        // Create search queries based on the real title
+        // Create search queries based on the real movie title from IMDB
         let searchQueries = [];
         
         if (type === 'movie') {
@@ -2184,45 +2421,22 @@ app.get('/:config/subtitles/:type/:id*', async (req, res) => {
 
         console.log(`[SUBTITLES] Total subtitles found: ${allSubtitles.length}`);
         
+        // Create comprehensive video info from all available sources
+        const videoInfo = subtitleMatcher.createVideoInfoFromStremio(stremioData, realDebridTechnical);
+        
         let sortedSubtitles;
         
-        // Use RealDebrid enhanced matching if available
-        if (realDebridInfo && realDebridInfo.originalTitle) {
-            console.log(`[SUBTITLES] Using RealDebrid enhanced matching`);
-            sortedSubtitles = subtitleMatcher.sortSubtitlesByRealDebridRelevance(allSubtitles, realDebridInfo, movieInfo.title);
-        } else {
-            console.log(`[SUBTITLES] Using standard matching`);
-            
-            // Extract video source for matching
-            let videoInfo = { source: 'unknown' };
-            
-            try {
-                // Create basic video info for source matching
-                let searchTitle = '';
-                if (type === 'movie') {
-                    searchTitle = `${movieInfo.title} ${movieInfo.year}`;
-                } else {
-                    searchTitle = `${movieInfo.title} S${season}E${episode}`;
-                }
-                
-                videoInfo = subtitleMatcher.extractVideoInfo(searchTitle);
-                
-                console.log(`[SUBTITLES] Using video source for matching: ${videoInfo.source}`);
-            } catch (error) {
-                console.log(`[SUBTITLES] Could not extract video source, using defaults`);
-            }
-
-            // Sort subtitles by source relevance to video
-            sortedSubtitles = subtitleMatcher.sortSubtitlesByRelevance(allSubtitles, videoInfo, movieInfo.title);
-        }
+        // Use enhanced technical matching
+        console.log(`[SUBTITLES] Using technical matching (${videoInfo.dataSource})`);
+        sortedSubtitles = subtitleMatcher.sortSubtitlesByTechnicalRelevance(allSubtitles, videoInfo, movieInfo.title);
         
         // Limit to top 6 results
         const topSubtitles = sortedSubtitles.slice(0, 6);
         
         const stremioSubtitles = topSubtitles.map((sub, index) => {
             const isTopMatch = index === 0;
-            const isRealDebridMatch = realDebridInfo && realDebridInfo.originalTitle;
-            const enhancedName = subtitleMatcher.createEnhancedSubtitleName(sub, isTopMatch, isRealDebridMatch);
+            const isTechnicalMatch = videoInfo.dataSource === 'realdebrid' || videoInfo.confidence > 70;
+            const enhancedName = subtitleMatcher.createEnhancedSubtitleName(sub, isTopMatch, isTechnicalMatch);
 
             const subtitle = {
                 id: `${sub.id}:${sub.linkFile}`,
@@ -2230,18 +2444,19 @@ app.get('/:config/subtitles/:type/:id*', async (req, res) => {
                 lang: sub.language.toLowerCase() === 'czech' ? 'cs' : 
                       sub.language.toLowerCase() === 'slovak' ? 'sk' : 'cs',
                 name: enhancedName,
-                rating: Math.min(5, Math.max(1, Math.round((sub.finalScore || sub.compatibilityScore || sub.realDebridScore) / 20)))
+                rating: Math.min(5, Math.max(1, Math.round((sub.finalScore || sub.compatibilityScore || sub.technicalScore) / 20)))
             };
             
-            if (isRealDebridMatch) {
-                console.log(`[SUBTITLES] ${index + 1}. "${sub.title}" → ${subtitle.name} (RD: ${sub.realDebridScore?.toFixed(1) || 'N/A'}%, Final: ${sub.finalScore?.toFixed(1) || 'N/A'}%, Rating: ${subtitle.rating})`);
-            } else {
-                console.log(`[SUBTITLES] ${index + 1}. "${sub.title}" → ${subtitle.name} (Source: ${sub.compatibilityScore}%, Title: ${sub.titleSimilarity?.toFixed(1) || 'N/A'}%, Final: ${sub.finalScore?.toFixed(1) || 'N/A'}%, Rating: ${subtitle.rating})`);
-            }
+            const scoreInfo = videoInfo.dataSource === 'realdebrid' ? 
+                `Tech: ${sub.technicalScore?.toFixed(1) || 'N/A'}%` :
+                `Est: ${sub.technicalScore?.toFixed(1) || 'N/A'}%`;
+                
+            console.log(`[SUBTITLES] ${index + 1}. "${sub.title}" → ${subtitle.name} (${scoreInfo}, Final: ${sub.finalScore?.toFixed(1) || 'N/A'}%, Rating: ${subtitle.rating})`);
             return subtitle;
         });
 
-        const matchingType = realDebridInfo && realDebridInfo.originalTitle ? 'RealDebrid-enhanced' : 'standard';
+        const matchingType = videoInfo.dataSource === 'realdebrid' ? 'RealDebrid-technical' : 
+                           videoInfo.dataSource === 'size_estimate' ? 'size-estimated' : 'standard';
         console.log(`[SUBTITLES] Returning ${stremioSubtitles.length} ${matchingType} matched subtitles to Stremio`);
         res.json({ subtitles: stremioSubtitles });
         
@@ -2454,43 +2669,56 @@ app.post('/test-realdebrid', async (req, res) => {
     }
 });
 
-// Optional: Add endpoint to test RealDebrid matching
-app.get('/test-realdebrid-matching/:config', async (req, res) => {
+// Optional: Add endpoint to test technical matching
+app.get('/test-technical-matching/:config', async (req, res) => {
     const { config } = req.params;
+    const { fileSize, quality, movieTitle, realDebridFile } = req.query;
     
     try {
         const decodedConfig = JSON.parse(Buffer.from(config, 'base64').toString());
         const { username, realDebridKey } = decodedConfig;
-
-        if (!realDebridKey) {
-            return res.status(400).json({ error: 'No RealDebrid API key in config' });
-        }
 
         const client = userSessions.get(username);
         if (!client) {
             return res.status(401).json({ error: 'Session expired' });
         }
 
-        const realDebridClient = new RealDebridClient(realDebridKey);
-        const currentFile = await realDebridClient.getCurrentlyPlayingFile();
-        const activeStreams = await realDebridClient.getActiveStreams();
-        
-        let realDebridInfo = null;
-        if (currentFile) {
-            realDebridInfo = subtitleMatcher.extractVideoInfoFromRealDebrid(currentFile.filename);
-        } else if (activeStreams) {
-            realDebridInfo = subtitleMatcher.extractVideoInfoFromRealDebrid(activeStreams.filename);
+        // Create test video info
+        const stremioData = {
+            movieTitle: movieTitle || 'Test Movie',
+            fileSize: fileSize ? parseInt(fileSize) : null,
+            quality: quality || '1080p',
+            duration: 120,
+            streamTitle: null
+        };
+
+        let realDebridTechnical = null;
+        if (realDebridKey && realDebridFile) {
+            realDebridTechnical = subtitleMatcher.extractTechnicalInfoFromRealDebrid(realDebridFile);
         }
+
+        const videoInfo = subtitleMatcher.createVideoInfoFromStremio(stremioData, realDebridTechnical);
+        
+        // Get some sample subtitles for testing
+        const subtitles = await client.searchSubtitles(movieTitle || 'test');
+        const sortedSubtitles = subtitleMatcher.sortSubtitlesByTechnicalRelevance(subtitles.slice(0, 10), videoInfo, movieTitle);
 
         res.json({
             success: true,
-            currentFile: currentFile,
-            activeStreams: activeStreams,
-            extractedInfo: realDebridInfo,
-            hasActiveContent: !!(currentFile || activeStreams)
+            testData: stremioData,
+            videoInfo: videoInfo,
+            realDebridTechnical: realDebridTechnical,
+            sampleResults: sortedSubtitles.slice(0, 5).map(sub => ({
+                title: sub.title,
+                videoVersion: sub.videoVersion,
+                detectedSource: sub.subtitleVideoInfo?.source || 'unknown',
+                technicalScore: sub.technicalScore,
+                finalScore: sub.finalScore,
+                enhancedName: subtitleMatcher.createEnhancedSubtitleName(sub, false, videoInfo.confidence > 70)
+            }))
         });
     } catch (error) {
-        console.error('[TEST-RD-MATCHING] Error:', error.message);
+        console.error('[TEST-TECH-MATCHING] Error:', error.message);
         res.status(500).json({ error: error.message });
     }
 });
