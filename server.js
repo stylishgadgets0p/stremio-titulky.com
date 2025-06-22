@@ -143,7 +143,6 @@ class RealDebridClient {
         } else if (filenameLower.includes('720p')) {
             return 'webrip'; // Default 720p to webrip
         }
-
         return 'unknown';
     }
 }
@@ -362,7 +361,6 @@ class SubtitleMatcher {
                 .replace(/\s+/g, ' ')         // Normalize spaces
                 .trim();
         };
-
         const normalizedMovie = normalizeTitle(movieTitle);
         const normalizedSubtitle = normalizeTitle(subtitleTitle);
 
@@ -839,3 +837,37 @@ class TitulkyClient {
         
         return detailedResults;
     }
+
+    // Dummy placeholder for searchSubtitles (implement your logic here)
+    async searchSubtitles(query) {
+        // TODO: Implement actual search logic
+        return [];
+    }
+
+    // Dummy placeholder for getCookieString (implement your logic here)
+    getCookieString() {
+        // TODO: Implement actual cookie logic
+        return '';
+    }
+}
+
+// Vytvoření instance klienta
+const titulkyClient = new TitulkyClient();
+
+// Definice endpointu pro titulky (ukázka, doplň si vlastní logiku)
+app.get('/subtitles', async (req, res) => {
+    try {
+        const { imdb_id: imdbId, query, type } = req.query;
+        // ... zde doplň logiku pro získání titulků
+        res.json({ subtitles: [] });  // Placeholder
+    } catch (error) {
+        console.error('Chyba v endpointu /subtitles:', error);
+        res.status(500).json({ error: 'Interní chyba serveru' });
+    }
+});
+
+// Spuštění serveru
+app.listen(PORT, () => {
+    console.log(`Server běží na portu ${PORT}`);
+    startKeepAlive();  // Spuštění keep-alive
+});
